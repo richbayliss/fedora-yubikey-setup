@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# Yubikey Linux Setup — Fedora 44
+# GPG agent for SSH + Git commit signing
+# ──────────────────────────────────────────────
+
+REQUIRED_FEDORA_VERSION="44"
+GPG_AGENT_CONF="${HOME}/.gnupg/gpg-agent.conf"
+SSH_CONFIG="${HOME}/.ssh/config"
+GPG_KEY_ID=""
+
+# ── Utils ─────────────────────────────────────
+
+red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
+warn()  { printf '\033[0;33m%s\033[0m\n' "$*"; }
+
+info()  { blue  ":: $*"; }
+ok()    { green "=> $*"; }
+err()   { red   "!! $*"; }
+
+confirm() {
+  printf "%s [y/N] " "$*" >&2
+  read -r resp
+  [[ "$resp" =~ ^[Yy] ]]
+}
+
+run_as_user() {
+  if [[ $EUID -eq 0 ]]; then
+    sudo -u "$SUDO_USER" "$@"
+  else
+    "$@"
+  fi
+}
+
+real_home() {
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    eval "~$SUDO_USER"
+  else
+    echo "$HOME"
+  fi
+}
+
+# ── Pre-flight ────────────────────────────────
+
+preflight() {
+  echo
+  blue "╔══════════════════════════════════════════╗"
+  blue "║  Yubikey Linux Setup — Fedora 44         ║"
+  blue "║  GPG agent · SSH · Git signing           ║"
+  blue "╚══════════════════════════════════════════╝"
+  echo
+
+  # OS check
+  if [[ ! -f /etc/fedora-release ]]; then
+    err "This script is designed for Fedora Linux only."
+    exit 1
+  fi
+
+  local version
+  version=$(rpm -E %fedora)
+  if [[ "$version" != "$REQUIRED_FEDORA_VERSION" ]]; then
+    warn "Detected Fedora ${version} (expected ${REQUIRED_FEDORA_VERSION})"
+    if ! confirm "Continue anyway?"; then
+      exit 1
+    fi
+  fi
+
+  info "Detected Fedora ${version}"
+
+  # Sudo check — re-exec if needed
+  if [[ $EUID -ne 0 ]]; then
+    info "Escalating privileges (package installs need sudo)..."
+    exec sudo bash "$0" "$@"
+  fi
+
+  info "Running with sufficient privileges"
+}
+
+# ── Collect Info ──────────────────────────────
+
+collect_info() {
+  echo
+  blue "── Configuration ──"
+  echo
+
+  local default_name default_email
+  default_name=$(run_as_user git config --global user.name 2>/dev/null || true)
+  default_email=$(run_as_user git config --global user.email 2>/dev/null || true)
+
+  read_with_default() {
+    local prompt="$1" default="$2" var_name="$3"
+    local val
+    if [[ -n "$default" ]]; then
+      printf "  %s [%s]: " "$prompt" "$default" >&2
+    else
+      printf "  %s: " "$prompt" >&2
+    fi
+    read -r val
+    if [[ -z "$val" && -n "$default" ]]; then
+      eval "$var_name='$default'"
+    else
+      eval "$var_name='$val'"
+    fi
+  }
+
+  read_with_default "Full name for Git" "$default_name" GIT_NAME
+  read_with_default "Email for Git" "$default_email" GIT_EMAIL
+
+  printf "  GPG key ID to use for signing (leave blank to skip): " >&2
+  read -r GPG_KEY_ID
+
+  if confirm "Enable SSH support via gpg-agent?"; then
+    ENABLE_SSH=true
+  else
+    ENABLE_SSH=false
+  fi
+
+  echo
+}
+
+# ── Install Packages ──────────────────────────
+
+install_packages() {
+  echo
+  blue "── Installing packages ──"
+  echo
+
+  local packages=(
+    gnupg2
+    pcsc-lite
+    pcsc-lite-ccid
+    ccid
+    opensc
+    ykpers
+    yubikey-manager
+    pinentry-gnome3
+  )
+
+  info "Installing: ${packages[*]}"
+  dnf install -y "${packages[@]}"
+  ok "Packages installed"
+}
+
+# ── Services ──────────────────────────────────
+
+configure_services() {
+  echo
+  blue "── Enabling services ──"
+  echo
+
+  systemctl enable --now pcscd
+  ok "pcscd enabled and started"
+}
+
+# ── GPG Agent ─────────────────────────────────
+
+configure_gpg_agent() {
+  echo
+  blue "── Configuring GPG agent ──"
+  echo
+
+  local user_home
+  user_home=$(real_home)
+  local agent_conf="${user_home}/.gnupg/gpg-agent.conf"
+
+  mkdir -p "${user_home}/.gnupg"
+  chmod 700 "${user_home}/.gnupg"
+
+  local pinentry="/usr/bin/pinentry-gnome3"
+  if [[ ! -x "$pinentry" ]]; then
+    for alt in /usr/bin/pinentry-qt /usr/bin/pinentry-curses /usr/bin/pinentry-tty; do
+      if [[ -x "$alt" ]]; then
+        pinentry="$alt"
+        break
+      fi
+    done
+  fi
+
+  touch "$agent_conf"
+
+  if ! grep -q "^enable-ssh-support" "$agent_conf" 2>/dev/null; then
+    cat >> "$agent_conf" <<EOF
+# Added by yubikey-linux-setup
+enable-ssh-support
+pinentry-program ${pinentry}
+EOF
+  else
+    info "gpg-agent.conf already has enable-ssh-support"
+  fi
+
+  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.gnupg" 2>/dev/null || true
+
+  # Kill and restart agent as user
+  run_as_user gpgconf --kill gpg-agent 2>/dev/null || true
+  run_as_user gpg-agent --daemon 2>/dev/null || true
+
+  ok "GPG agent configured"
+}
+
+# ── SSH ────────────────────────────────────────
+
+configure_ssh() {
+  if [[ "$ENABLE_SSH" != true ]]; then
+    info "Skipping SSH configuration"
+    return
+  fi
+
+  echo
+  blue "── Configuring SSH for GPG agent ──"
+  echo
+
+  local user_home
+  user_home=$(real_home)
+
+  mkdir -p "${user_home}/.ssh"
+  chmod 700 "${user_home}/.ssh"
+
+  # Add GPG agent socket as an SSH key provider
+  local sock_path="\${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent.ssh"
+
+  local env_file="${user_home}/.config/yubikey-linux-setup/env"
+  mkdir -p "$(dirname "$env_file")"
+
+  cat > "$env_file" <<EOF
+# Added by yubikey-linux-setup
+export SSH_AUTH_SOCK="\${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent.ssh"
+export GPG_TTY="\$(tty)"
+EOF
+
+  # Source it from bashrc if not already there
+  local bashrc="${user_home}/.bashrc"
+  local source_line=". \"\${HOME}/.config/yubikey-linux-setup/env\""
+  if ! grep -qF "yubikey-linux-setup/env" "$bashrc" 2>/dev/null; then
+    echo "" >> "$bashrc"
+    echo "# Added by yubikey-linux-setup" >> "$bashrc"
+    echo "$source_line" >> "$bashrc"
+    ok "Added env sourcing to .bashrc"
+  else
+    info "Env sourcing already in .bashrc"
+  fi
+
+  # AddKeysToAgent in ssh config
+  local ssh_config="${user_home}/.ssh/config"
+  if [[ ! -f "$ssh_config" ]]; then
+    echo "# Added by yubikey-linux-setup" > "$ssh_config"
+    echo "AddKeysToAgent yes" >> "$ssh_config"
+  else
+    if ! grep -q "^AddKeysToAgent" "$ssh_config" 2>/dev/null; then
+      echo "" >> "$ssh_config"
+      echo "# Added by yubikey-linux-setup" >> "$ssh_config"
+      echo "AddKeysToAgent yes" >> "$ssh_config"
+    fi
+  fi
+
+  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.ssh" 2>/dev/null || true
+  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$(dirname "$env_file")" 2>/dev/null || true
+
+  ok "SSH configured to use GPG agent"
+}
+
+# ── Git ────────────────────────────────────────
+
+configure_git() {
+  echo
+  blue "── Configuring Git ──"
+  echo
+
+  local needs_signing=false
+
+  if [[ -n "$GIT_NAME" ]]; then
+    run_as_user git config --global user.name "$GIT_NAME"
+    ok "Git user.name set to: $GIT_NAME"
+  fi
+
+  if [[ -n "$GIT_EMAIL" ]]; then
+    run_as_user git config --global user.email "$GIT_EMAIL"
+    ok "Git user.email set to: $GIT_EMAIL"
+  fi
+
+  if [[ -n "$GPG_KEY_ID" ]]; then
+    run_as_user git config --global user.signingkey "$GPG_KEY_ID"
+    run_as_user git config --global commit.gpgsign true
+    info "Git signing key set to: $GPG_KEY_ID"
+    needs_signing=true
+  fi
+
+  run_as_user git config --global gpg.program gpg2
+
+  # If a key was specified, test the setup
+  if [[ "$needs_signing" == true ]]; then
+    echo
+    info "Testing GPG signing..."
+    run_as_user bash -c "echo test | gpg2 --clearsign > /dev/null 2>&1" && {
+      ok "GPG signing works"
+    } || {
+      warn "GPG signing test failed. You may need to configure your Yubikey GPG keys."
+      warn "See: https://docs.yubico.com/yesdk/users-manual/application-piv/generate-key.html"
+    }
+  fi
+
+  ok "Git configured"
+}
+
+# ── Yubikey udev ──────────────────────────────
+
+configure_udev() {
+  echo
+  blue "── Checking udev rules ──"
+  echo
+
+  # Modern Fedora packages include Yubikey udev rules via libyubikey/ykpers
+  # but we ensure the standard ones are in place
+  local rules_file="/etc/udev/rules.d/70-yubikey.rules"
+
+  if [[ ! -f "$rules_file" ]]; then
+    cat > "$rules_file" <<'EOF'
+# Yubikey U2F / CCID udev rules
+ACTION!="add|change", GOTO="yubikey_end"
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0113|0114|0115|0116|0120|0121|0200|0401|0402|0403|0404|0405|0406|0407|0410", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0010|0011|0030|0040", TAG+="uaccess"
+
+LABEL="yubikey_end"
+EOF
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger 2>/dev/null || true
+    ok "Udev rules installed for Yubikey"
+  else
+    info "Yubikey udev rules already present"
+  fi
+}
+
+# ── Summary ───────────────────────────────────
+
+print_summary() {
+  echo
+  green "╔══════════════════════════════════════════╗"
+  green "║  Setup complete!                         ║"
+  green "╚══════════════════════════════════════════╝"
+  echo
+
+  if [[ -n "$GPG_KEY_ID" ]]; then
+    info "Git signing key  : $GPG_KEY_ID"
+  fi
+  if [[ -n "$GIT_EMAIL" ]]; then
+    info "Git email        : $GIT_EMAIL"
+  fi
+  if [[ -n "$GIT_NAME" ]]; then
+    info "Git name         : $GIT_NAME"
+  fi
+
+  echo
+  info "Next steps:"
+  info "  1. Log out and back in (or run: source ~/.bashrc)"
+  info "  2. Verify GPG keys: gpg --card-status"
+  info "  3. List SSH keys  : ssh-add -l"
+  if [[ -n "$GPG_KEY_ID" ]]; then
+    info "  4. Test signing   : git commit --allow-empty -m test"
+  fi
+  echo
+  info "If you don't have GPG keys on your Yubikey yet:"
+  info "  ykman piv generate-key --pin-policy NEVER --touch-policy CACHE 9a pubkey.pem"
+  info "  ykman piv generate-certificate --pin-policy NEVER --touch-policy CACHE -s 9a pubkey.pem"
+  info "  gpg --edit-card"
+  echo
+}
+
+# ── Main ──────────────────────────────────────
+
+main() {
+  preflight "$@"
+  collect_info
+  install_packages
+  configure_services
+  configure_gpg_agent
+  configure_ssh
+  configure_udev
+  configure_git
+  print_summary
+}
+
+main "$@"
