@@ -29,7 +29,7 @@ confirm() {
 }
 
 run_as_user() {
-  if [[ $EUID -eq 0 ]]; then
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
     sudo -u "$SUDO_USER" "$@"
   else
     "$@"
@@ -258,7 +258,7 @@ EOF
     info "gpg-agent.conf already has enable-ssh-support"
   fi
 
-  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.gnupg" 2>/dev/null || true
+  chown -R "${SUDO_USER:-}:$(id -gn "${SUDO_USER:-}")" "${user_home}/.gnupg" 2>/dev/null || true
 
   ok "GPG agent configured"
 }
@@ -287,7 +287,7 @@ EOF
     info "scdaemon.conf already has disable-ccid"
   fi
 
-  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.gnupg" 2>/dev/null || true
+  chown -R "${SUDO_USER:-}:$(id -gn "${SUDO_USER:-}")" "${user_home}/.gnupg" 2>/dev/null || true
 
   ok "scdaemon configured"
 }
@@ -343,8 +343,8 @@ EOF
     fi
   fi
 
-  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.ssh" 2>/dev/null || true
-  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "$(dirname "$env_file")" 2>/dev/null || true
+  chown -R "${SUDO_USER:-}:$(id -gn "${SUDO_USER:-}")" "${user_home}/.ssh" 2>/dev/null || true
+  chown -R "${SUDO_USER:-}:$(id -gn "${SUDO_USER:-}")" "$(dirname "$env_file")" 2>/dev/null || true
 
   ok "SSH configured to use GPG agent"
 }
