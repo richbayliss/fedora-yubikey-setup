@@ -38,10 +38,49 @@ run_as_user() {
 
 real_home() {
   if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
-    eval "~$SUDO_USER"
+    getent passwd "$SUDO_USER" | cut -d: -f6
   else
     echo "$HOME"
   fi
+}
+
+user_shell() {
+  if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
+    getent passwd "$SUDO_USER" | cut -d: -f7
+  else
+    echo "$SHELL"
+  fi
+}
+
+shell_rc_files() {
+  local home
+  home=$(real_home)
+  local shell
+  shell=$(user_shell)
+  local shell_name
+  shell_name=$(basename "$shell")
+
+  case "$shell_name" in
+    zsh)
+      printf "%s/.zshrc\n" "$home"
+      ;;
+  esac
+  # Always include .bashrc as a fallback
+  printf "%s/.bashrc\n" "$home"
+}
+
+add_env_to_rc() {
+  local rc_file="$1"
+  local source_line="$2"
+  if [[ ! -f "$rc_file" ]]; then
+    return
+  fi
+  if grep -qF "yubikey-linux-setup/env" "$rc_file" 2>/dev/null; then
+    return
+  fi
+  echo "" >> "$rc_file"
+  echo "# Added by yubikey-linux-setup" >> "$rc_file"
+  echo "$source_line" >> "$rc_file"
 }
 
 # ── Pre-flight ────────────────────────────────
@@ -101,9 +140,9 @@ collect_info() {
     fi
     read -r val
     if [[ -z "$val" && -n "$default" ]]; then
-      eval "$var_name='$default'"
+      printf -v "$var_name" "%s" "$default"
     else
-      eval "$var_name='$val'"
+      printf -v "$var_name" "%s" "$val"
     fi
   }
 
@@ -131,9 +170,9 @@ install_packages() {
 
   local packages=(
     gnupg2
+    gnupg2-scdaemon
     pcsc-lite
     pcsc-lite-ccid
-    ccid
     opensc
     ykpers
     yubikey-manager
@@ -153,7 +192,12 @@ configure_services() {
   echo
 
   systemctl enable --now pcscd
-  ok "pcscd enabled and started"
+  systemctl restart pcscd 2>/dev/null || true
+  if systemctl is-active --quiet pcscd; then
+    ok "pcscd enabled and running"
+  else
+    warn "pcscd service is not active — check systemctl status pcscd"
+  fi
 }
 
 # ── GPG Agent ─────────────────────────────────
@@ -194,11 +238,36 @@ EOF
 
   chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.gnupg" 2>/dev/null || true
 
-  # Kill and restart agent as user
-  run_as_user gpgconf --kill gpg-agent 2>/dev/null || true
-  run_as_user gpg-agent --daemon 2>/dev/null || true
-
   ok "GPG agent configured"
+}
+
+# ── scdaemon ──────────────────────────────────
+
+configure_scdaemon() {
+  echo
+  blue "── Configuring scdaemon ──"
+  echo
+
+  local user_home
+  user_home=$(real_home)
+  local scd_conf="${user_home}/.gnupg/scdaemon.conf"
+
+  mkdir -p "${user_home}/.gnupg"
+  chmod 700 "${user_home}/.gnupg"
+
+  if [[ ! -f "$scd_conf" ]] || ! grep -q "^disable-ccid" "$scd_conf" 2>/dev/null; then
+    cat >> "$scd_conf" <<'EOF'
+# Added by yubikey-linux-setup
+disable-ccid
+EOF
+    ok "scdaemon.conf created with disable-ccid"
+  else
+    info "scdaemon.conf already has disable-ccid"
+  fi
+
+  chown -R "$SUDO_USER:$(id -gn "$SUDO_USER")" "${user_home}/.gnupg" 2>/dev/null || true
+
+  ok "scdaemon configured"
 }
 
 # ── SSH ────────────────────────────────────────
@@ -231,17 +300,13 @@ export SSH_AUTH_SOCK="\${XDG_RUNTIME_DIR}/gnupg/S.gpg-agent.ssh"
 export GPG_TTY="\$(tty)"
 EOF
 
-  # Source it from bashrc if not already there
-  local bashrc="${user_home}/.bashrc"
+  # Source env in the user's shell rc files
   local source_line=". \"\${HOME}/.config/yubikey-linux-setup/env\""
-  if ! grep -qF "yubikey-linux-setup/env" "$bashrc" 2>/dev/null; then
-    echo "" >> "$bashrc"
-    echo "# Added by yubikey-linux-setup" >> "$bashrc"
-    echo "$source_line" >> "$bashrc"
-    ok "Added env sourcing to .bashrc"
-  else
-    info "Env sourcing already in .bashrc"
-  fi
+  local rc_file
+  while IFS= read -r rc_file; do
+    add_env_to_rc "$rc_file" "$source_line"
+  done <<< "$(shell_rc_files | sort -u)"
+  ok "Added env sourcing to shell rc files"
 
   # AddKeysToAgent in ssh config
   local ssh_config="${user_home}/.ssh/config"
@@ -305,6 +370,27 @@ configure_git() {
   ok "Git configured"
 }
 
+# ── Restart GPG stack ─────────────────────────
+
+restart_gpg_stack() {
+  echo
+  blue "── Restarting PC/SC and GPG stack ──"
+  echo
+
+  # Restart pcscd to clear any stale card claims (e.g. from earlier
+  # debugging tools). Without this, scdaemon can get a "sharing
+  # violation" from PC/SC if another process has the card open.
+  systemctl restart pcscd 2>/dev/null || true
+  sleep 1
+
+  # Kill both agent and scdaemon so they pick up the new config files
+  # on next access. The agent will be auto-started by gpg on demand.
+  run_as_user gpgconf --kill scdaemon 2>/dev/null || true
+  run_as_user gpgconf --kill gpg-agent 2>/dev/null || true
+
+  ok "PC/SC and GPG stack restarted"
+}
+
 # ── Yubikey udev ──────────────────────────────
 
 configure_udev() {
@@ -355,7 +441,7 @@ print_summary() {
 
   echo
   info "Next steps:"
-  info "  1. Log out and back in (or run: source ~/.bashrc)"
+  info "  1. Log out and back in (or run: source ~/.bashrc or source ~/.zshrc)"
   info "  2. Verify GPG keys: gpg --card-status"
   info "  3. List SSH keys  : ssh-add -l"
   if [[ -n "$GPG_KEY_ID" ]]; then
@@ -377,9 +463,11 @@ main() {
   install_packages
   configure_services
   configure_gpg_agent
+  configure_scdaemon
   configure_ssh
   configure_udev
   configure_git
+  restart_gpg_stack
   print_summary
 }
 

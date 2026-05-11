@@ -1,12 +1,13 @@
 # yubikey-linux-setup
 
 One-shot setup script to configure a **Fedora 44** system for Yubikey-backed
-GPG with SSH agent and Git commit signing.
+GPG with SSH agent and Git commit signing. Detects your login shell
+(bash/zsh) and configures the right rc files automatically.
 
 ## Usage
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<user>/yubikey-linux-setup/main/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/richbayliss/yubikey-linux-setup/main/setup.sh)
 ```
 
 The script will:
@@ -22,10 +23,11 @@ The script will:
 
 | Area | Change |
 |------|--------|
-| **Packages** | `gnupg2`, `pcsc-lite`, `pcsc-lite-ccid`, `ccid`, `opensc`, `ykpers`, `yubikey-manager`, `pinentry-gnome3` |
+| **Packages** | `gnupg2`, `gnupg2-scdaemon`, `pcsc-lite`, `pcsc-lite-ccid`, `opensc`, `ykpers`, `yubikey-manager`, `pinentry-gnome3` |
 | **Services** | `pcscd` enabled |
+| **scdaemon** | `~/.gnupg/scdaemon.conf` — `disable-ccid` (forces use of pcscd instead of internal CCID driver, required for Yubikey) |
 | **GPG agent** | `~/.gnupg/gpg-agent.conf` — SSH support + pinentry |
-| **SSH** | `~/.config/yubikey-linux-setup/env` sourced from `.bashrc`, `AddKeysToAgent yes` in `~/.ssh/config` |
+| **SSH** | `~/.config/yubikey-linux-setup/env` sourced from `.bashrc` / `.zshrc` (auto-detected), `AddKeysToAgent yes` in `~/.ssh/config` |
 | **Git** | `user.name`, `user.email`, `user.signingkey`, `commit.gpgsign true`, `gpg.program gpg2` |
 | **udev** | `/etc/udev/rules.d/70-yubikey.rules` — `uaccess` tag for Yubikey HID devices |
 
@@ -38,7 +40,8 @@ The script will:
 
 ```bash
 # Source the environment (or log out and back in)
-source ~/.bashrc
+source ~/.bashrc   # bash
+source ~/.zshrc    # zsh
 
 # Verify the card is detected
 gpg --card-status
