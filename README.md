@@ -1,5 +1,7 @@
 # yubikey-linux-setup
 
+[GitHub](https://github.com/richbayliss/fedora-yubikey-setup)
+
 One-shot setup script to configure a **Fedora 44** system for Yubikey-backed
 GPG with SSH agent and Git commit signing. Detects your login shell
 (bash/zsh) and configures the right rc files automatically.
@@ -7,7 +9,7 @@ GPG with SSH agent and Git commit signing. Detects your login shell
 ## Usage
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/richbayliss/yubikey-linux-setup/main/setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/richbayliss/fedora-yubikey-setup/main/setup.sh)
 ```
 
 The script will:
