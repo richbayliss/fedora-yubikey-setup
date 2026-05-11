@@ -121,6 +121,11 @@ preflight() {
 
 # ── Collect Info ──────────────────────────────
 
+detect_yubikey_gpg_key() {
+  gpg2 --card-status 2>/dev/null | \
+    awk -F': ' '/^Signature key/ {gsub(/ /, "", $2); print $2}'
+}
+
 collect_info() {
   echo
   blue "── Configuration ──"
@@ -149,8 +154,19 @@ collect_info() {
   read_with_default "Full name for Git" "$default_name" GIT_NAME
   read_with_default "Email for Git" "$default_email" GIT_EMAIL
 
-  printf "  GPG key ID to use for signing (leave blank to skip): " >&2
-  read -r GPG_KEY_ID
+  local detected_key
+  detected_key=$(detect_yubikey_gpg_key) || true
+  if [[ -n "$detected_key" ]]; then
+    info "Detected GPG key on Yubikey: ${detected_key:0:4}...${detected_key: -8}"
+    if confirm "Use this key for Git signing?"; then
+      GPG_KEY_ID="$detected_key"
+    fi
+  fi
+
+  if [[ -z "${GPG_KEY_ID:-}" ]]; then
+    printf "  GPG key ID to use for signing (leave blank to skip): " >&2
+    read -r GPG_KEY_ID
+  fi
 
   if confirm "Enable SSH support via gpg-agent?"; then
     ENABLE_SSH=true
