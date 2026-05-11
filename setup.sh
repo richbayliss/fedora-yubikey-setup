@@ -36,6 +36,14 @@ run_as_user() {
   fi
 }
 
+maybe_sudo() {
+  if [[ $EUID -ne 0 ]]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
 real_home() {
   if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then
     getent passwd "$SUDO_USER" | cut -d: -f6
@@ -110,13 +118,11 @@ preflight() {
 
   info "Detected Fedora ${version}"
 
-  # Sudo check — re-exec if needed
+  # Sudo check — cache credentials for per-command sudo usage
   if [[ $EUID -ne 0 ]]; then
     info "Escalating privileges (package installs need sudo)..."
-    exec sudo bash "$0" "$@"
+    sudo -v
   fi
-
-  info "Running with sufficient privileges"
 }
 
 # ── Collect Info ──────────────────────────────
@@ -196,7 +202,7 @@ install_packages() {
   )
 
   info "Installing: ${packages[*]}"
-  dnf install -y "${packages[@]}"
+  maybe_sudo dnf install -y "${packages[@]}"
   ok "Packages installed"
 }
 
@@ -207,9 +213,9 @@ configure_services() {
   blue "── Enabling services ──"
   echo
 
-  systemctl enable --now pcscd
-  systemctl restart pcscd 2>/dev/null || true
-  if systemctl is-active --quiet pcscd; then
+  maybe_sudo systemctl enable --now pcscd
+  maybe_sudo systemctl restart pcscd 2>/dev/null || true
+  if maybe_sudo systemctl is-active --quiet pcscd; then
     ok "pcscd enabled and running"
   else
     warn "pcscd service is not active — check systemctl status pcscd"
@@ -396,7 +402,7 @@ restart_gpg_stack() {
   # Restart pcscd to clear any stale card claims (e.g. from earlier
   # debugging tools). Without this, scdaemon can get a "sharing
   # violation" from PC/SC if another process has the card open.
-  systemctl restart pcscd 2>/dev/null || true
+  maybe_sudo systemctl restart pcscd 2>/dev/null || true
   sleep 1
 
   # Kill both agent and scdaemon so they pick up the new config files
@@ -419,7 +425,7 @@ configure_udev() {
   local rules_file="/etc/udev/rules.d/70-yubikey.rules"
 
   if [[ ! -f "$rules_file" ]]; then
-    cat > "$rules_file" <<'EOF'
+    maybe_sudo tee "$rules_file" > /dev/null <<'EOF'
 # Yubikey U2F / CCID udev rules
 ACTION!="add|change", GOTO="yubikey_end"
 
@@ -428,8 +434,8 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", ATTRS{idProduct}=="0010|0011|0030|
 
 LABEL="yubikey_end"
 EOF
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger 2>/dev/null || true
+    maybe_sudo udevadm control --reload-rules 2>/dev/null || true
+    maybe_sudo udevadm trigger 2>/dev/null || true
     ok "Udev rules installed for Yubikey"
   else
     info "Yubikey udev rules already present"
