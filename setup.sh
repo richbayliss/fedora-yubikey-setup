@@ -10,6 +10,18 @@ REQUIRED_FEDORA_VERSION="44"
 GPG_AGENT_CONF="${HOME}/.gnupg/gpg-agent.conf"
 SSH_CONFIG="${HOME}/.ssh/config"
 GPG_KEY_ID=""
+UNINSTALL=false
+
+PACKAGES=(
+  gnupg2
+  gnupg2-scdaemon
+  pcsc-lite
+  pcsc-lite-ccid
+  opensc
+  ykpers
+  yubikey-manager
+  pinentry-gnome3
+)
 
 # ── Utils ─────────────────────────────────────
 
@@ -89,6 +101,21 @@ add_env_to_rc() {
   echo "" >> "$rc_file"
   echo "# Added by yubikey-linux-setup" >> "$rc_file"
   echo "$source_line" >> "$rc_file"
+}
+
+remove_env_from_rc() {
+  local rc_file="$1"
+  if [[ ! -f "$rc_file" ]]; then
+    return
+  fi
+  local tmp
+  tmp=$(mktemp)
+  awk '
+    /Added by yubikey-linux-setup/ { skip=1; next }
+    /yubikey-linux-setup\/env/     { skip=1; next }
+    skip && /^[^#]/                 { skip=0 }
+    !skip                           { print }
+  ' "$rc_file" > "$tmp" && mv "$tmp" "$rc_file"
 }
 
 # ── Pre-flight ────────────────────────────────
@@ -190,19 +217,8 @@ install_packages() {
   blue "── Installing packages ──"
   echo
 
-  local packages=(
-    gnupg2
-    gnupg2-scdaemon
-    pcsc-lite
-    pcsc-lite-ccid
-    opensc
-    ykpers
-    yubikey-manager
-    pinentry-gnome3
-  )
-
-  info "Installing: ${packages[*]}"
-  maybe_sudo dnf install -y "${packages[@]}"
+  info "Installing: ${PACKAGES[*]}"
+  maybe_sudo dnf install -y "${PACKAGES[@]}"
   ok "Packages installed"
 }
 
@@ -480,17 +496,151 @@ print_summary() {
 # ── Main ──────────────────────────────────────
 
 main() {
-  preflight "$@"
-  collect_info
-  install_packages
-  configure_services
-  configure_gpg_agent
-  configure_scdaemon
-  configure_ssh
-  configure_udev
-  configure_git
-  restart_gpg_stack
-  print_summary
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --uninstall|-u)
+        UNINSTALL=true
+        shift
+        ;;
+      --help|-h)
+        printf "Usage: %s [--uninstall|-u]\n" "$0"
+        exit 0
+        ;;
+      *)
+        printf "Unknown option: %s\n" "$1" >&2
+        printf "Usage: %s [--uninstall|-u]\n" "$0"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ "$UNINSTALL" == true ]]; then
+    uninstall
+  else
+    preflight "$@"
+    collect_info
+    install_packages
+    configure_services
+    configure_gpg_agent
+    configure_scdaemon
+    configure_ssh
+    configure_udev
+    configure_git
+    restart_gpg_stack
+    print_summary
+  fi
+}
+
+uninstall() {
+  echo
+  red "╔══════════════════════════════════════════╗"
+  red "║  Yubikey Setup Uninstall                ║"
+  red "╚══════════════════════════════════════════╝"
+  echo
+
+  if ! confirm "This will remove packages and revert config file changes. Continue?"; then
+    exit 1
+  fi
+
+  local user_home
+  user_home=$(real_home)
+
+  echo
+  blue "── Removing packages ──"
+  echo
+  if maybe_sudo dnf remove -y "${PACKAGES[@]}" 2>/dev/null; then
+    ok "Packages removed"
+  else
+    warn "Some packages may not have been installed or are already removed"
+  fi
+
+  echo
+  blue "── Disabling pcscd service ──"
+  echo
+  maybe_sudo systemctl disable --now pcscd 2>/dev/null || true
+  ok "pcscd disabled"
+
+  echo
+  blue "── Reverting gpg-agent.conf ──"
+  echo
+  local agent_conf="${user_home}/.gnupg/gpg-agent.conf"
+  if [[ -f "$agent_conf" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk '
+      /Added by yubikey-linux-setup/ { skip=1; next }
+      skip && /^[^# \t]/              { skip=0 }
+      !skip                           { print }
+    ' "$agent_conf" > "$tmp" && mv "$tmp" "$agent_conf"
+    ok "gpg-agent.conf reverted"
+  else
+    info "No gpg-agent.conf found"
+  fi
+
+  echo
+  blue "── Reverting scdaemon.conf ──"
+  echo
+  local scd_conf="${user_home}/.gnupg/scdaemon.conf"
+  if [[ -f "$scd_conf" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk '
+      /Added by yubikey-linux-setup/ { skip=1; next }
+      skip && /^[^# \t]/              { skip=0 }
+      !skip                           { print }
+    ' "$scd_conf" > "$tmp" && mv "$tmp" "$scd_conf"
+    ok "scdaemon.conf reverted"
+  else
+    info "No scdaemon.conf found"
+  fi
+
+  echo
+  blue "── Removing SSH configuration ──"
+  echo
+  local env_file="${user_home}/.config/yubikey-linux-setup/env"
+  if [[ -f "$env_file" ]]; then
+    rm -f "$env_file"
+    rmdir "${user_home}/.config/yubikey-linux-setup" 2>/dev/null || true
+    rmdir "${user_home}/.config" 2>/dev/null || true
+    ok "Removed $env_file"
+  fi
+
+  local ssh_config="${user_home}/.ssh/config"
+  if [[ -f "$ssh_config" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk '
+      /Added by yubikey-linux-setup/ { skip=1; next }
+      /^AddKeysToAgent/              { skip=1; next }
+      skip && /^[^# \t]/              { skip=0 }
+      !skip                           { print }
+    ' "$ssh_config" > "$tmp" && mv "$tmp" "$ssh_config"
+    ok "ssh config reverted"
+  fi
+
+  local rc_file
+  while IFS= read -r rc_file; do
+    if [[ -f "$rc_file" ]]; then
+      remove_env_from_rc "$rc_file"
+    fi
+  done <<< "$(shell_rc_files | sort -u)"
+  ok "Removed env sourcing from shell rc files"
+
+  echo
+  blue "── Removing udev rules ──"
+  echo
+  maybe_sudo rm -f /etc/udev/rules.d/70-yubikey.rules 2>/dev/null && {
+    maybe_sudo udevadm control --reload-rules 2>/dev/null || true
+    ok "Removed /etc/udev/rules.d/70-yubikey.rules"
+  } || info "No udev rules file found"
+
+  echo
+  green "╔══════════════════════════════════════════╗"
+  green "║  Uninstall complete                      ║"
+  green "╚══════════════════════════════════════════╝"
+  echo
+  info "Note: Git config changes (user.name, user.email, etc.) were not reverted."
+  echo
 }
 
 main "$@"
